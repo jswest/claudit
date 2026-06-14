@@ -1,0 +1,24 @@
+# report-spending — per-user config (TOML)
+#
+# Copy this to ~/.claude/report-spending.toml and edit. Everything is optional;
+# omit a key to take the built-in default. Command-line flags override anything
+# set here. This file lives OUTSIDE the skill directory on purpose — that's how
+# the skill script (report.py) stays byte-identical across machines while each
+# person keeps their own plan price.
+
+# Your monthly subscription price, for the "× the plan" value comparison.
+#   Max 20x = 200, Max 5x = 100, Pro = 20. Default: 200.
+plan = 200
+
+# Transcript retention horizon in days. Normally read from your Claude Code
+# settings (cleanupPeriodDays); set this only to override. Default: from settings, else 30.
+# retention = 30
+
+# Where your session transcripts live. Default: ~/.claude/projects
+# projects = "~/.claude/projects"
+
+# Rows in the day-by-day table. Default: 30 (capped at the days of data on disk).
+# days = 30
+
+# Colourize output. Default: "always". "auto" = only at a TTY (honours NO_COLOR); "never" = off.
+# color = "always"
