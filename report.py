@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""report-spending — what your Claude Code usage would have cost on the pay-as-you-go API.
+"""claudit — what your Claude Code usage would have cost on the pay-as-you-go API.
 
 Walks every session transcript under ~/.claude/projects/**/*.jsonl, prices each
 assistant turn against current Anthropic API rates (exact cache-tier accounting),
@@ -7,16 +7,32 @@ and reports the API-equivalent cost across a set of time windows plus a daily
 chart. You're on a flat subscription, so this is a hypothetical "à la carte"
 figure — a subscription-value report, not a bill.
 
+Beyond the report, claudit does two durable things on its first run each day (or
+whenever --collect is passed):
+
+  * Persistence — upserts a per-session JSONL archive (~/.claude/claudit/
+    archive.jsonl) so cost history survives Claude Code's transcript cleanup.
+    Later runs render from archive ∪ live transcripts, so windows fill in past
+    the retention horizon instead of evaporating.
+
+  * Schema audit — diffs the keys actually present in your transcripts and
+    usage-data against a known-fields manifest, and flags new fields (possible
+    new cost drivers) or vanished ones (a lever we relied on). See SCHEMA_MANIFEST.
+
 Usage:
     report.py [--days N] [--plan PRICE] [--retention N] [--json]
-              [--projects DIR] [--config PATH]
+              [--projects DIR] [--config PATH] [--archive PATH] [--collect]
 
     --days N       Number of days in the daily chart (default: auto from retention).
     --plan PRICE   Monthly subscription price for the value comparison (default 200).
     --retention N  Override cleanupPeriodDays instead of reading it from settings.
     --json         Emit machine-readable JSON instead of the text report.
     --projects DIR Override the transcripts directory (default ~/.claude/projects).
-    --config PATH  TOML config with per-user defaults (default ~/.claude/report-spending.toml).
+    --config PATH  TOML config with per-user defaults (default ~/.claude/claudit.toml).
+    --archive PATH Per-session archive file (default ~/.claude/claudit/archive.jsonl).
+    --collect      Force the full path (refresh archive + run schema audit) even if
+                   already done today. The full path also runs automatically on the
+                   first invocation of each local day.
 
 Tunables (plan, retention, projects, days) resolve as: CLI flag > config file >
 built-in default. The config is signet's per-target file — the script itself stays
@@ -25,6 +41,7 @@ byte-identical across machines; your plan price lives in the TOML, not the code.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import sys
@@ -44,6 +61,71 @@ BASE_RATES = {
     "claude-sonnet-4-5":  {"in": 3.0,  "out": 15.0},
     "claude-haiku-4-5":   {"in": 1.0,  "out": 5.0},
 }
+
+# --- Schema manifest --------------------------------------------------------
+# The known-fields baseline, version-controlled here in the script (same home as
+# BASE_RATES, the other "what we know how to read" table). The schema audit diffs
+# what's actually on disk against this and reports the delta; SKILL.md tasks the
+# agent with judging any delta. Baselined from observed data on 2026-06-14.
+#
+# Per key: "class" — "always" (alarm if it drops to ~0; we depend on it) or
+# "optional" (legitimately absent on some records — never alarm on absence).
+# "consumed" marks a field the pricing path actually reads. "driver" marks a
+# field that looks billable but we do NOT yet price — surfaced as a heads-up.
+_ALWAYS = {"class": "always"}
+_OPTIONAL = {"class": "optional"}
+
+SCHEMA_MANIFEST = {
+    "version": 1,
+    "surfaces": {
+        # message.usage in transcripts
+        "usage": {
+            "input_tokens":                {"class": "always", "consumed": True},
+            "output_tokens":               {"class": "always", "consumed": True},
+            "cache_read_input_tokens":     {"class": "always", "consumed": True},
+            "cache_creation_input_tokens": {"class": "always", "consumed": True},
+            "cache_creation":              {"class": "always", "consumed": True},
+            "service_tier":                _ALWAYS,
+            "inference_geo":               _ALWAYS,
+            "iterations":                  _OPTIONAL,
+            "speed":                       _OPTIONAL,
+            "server_tool_use": {"class": "optional", "driver": True,
+                                "note": "server-side tool calls (e.g. web search); "
+                                        "unpriced — watch as a billable dimension"},
+            "output_tokens_details":       _OPTIONAL,
+        },
+        # message.usage.cache_creation.* — the 5m/1h write split we price exactly
+        "usage_cache_creation": {
+            "ephemeral_5m_input_tokens": {"class": "always", "consumed": True},
+            "ephemeral_1h_input_tokens": {"class": "always", "consumed": True},
+        },
+        # ~/.claude/usage-data/session-meta/*.json
+        "session_meta": {k: _ALWAYS for k in (
+            "session_id", "project_path", "start_time", "duration_minutes",
+            "user_message_count", "assistant_message_count", "tool_counts",
+            "languages", "git_commits", "git_pushes", "input_tokens",
+            "output_tokens", "first_prompt", "user_interruptions",
+            "user_response_times", "tool_errors", "tool_error_categories",
+            "uses_task_agent", "uses_mcp", "uses_web_search", "uses_web_fetch",
+            "lines_added", "lines_removed", "files_modified", "message_hours",
+            "user_message_timestamps",
+        )},
+        # ~/.claude/usage-data/facets/*.json
+        "facets": {k: _ALWAYS for k in (
+            "underlying_goal", "goal_categories", "outcome",
+            "user_satisfaction_counts", "claude_helpfulness", "session_type",
+            "friction_counts", "friction_detail", "primary_success",
+            "brief_summary", "session_id",
+        )},
+    },
+}
+
+# A surface is too thin to trust for "GONE" alarms below this many records; an
+# "always" field seen in fewer than ALWAYS_MIN of them is reported as vanished.
+SCHEMA_MIN_SAMPLE = 20
+SCHEMA_ALWAYS_MIN = 0.5
+
+ARCHIVE_VERSION = 1
 
 
 def rates_for(model: str):
@@ -70,90 +152,295 @@ def rates_for(model: str):
     }
 
 
-def cost_of(usage: dict, r: dict) -> float:
+def usage_components(usage: dict):
+    """Token counts from a usage object as (input, output, cache_read, w5, w1),
+    where w5/w1 are 5-minute / 1-hour cache writes. When the ephemeral split is
+    absent, all cache-creation is treated as a 5-minute write."""
     cc = usage.get("cache_creation") or {}
     w5 = cc.get("ephemeral_5m_input_tokens")
     w1 = cc.get("ephemeral_1h_input_tokens")
     if w5 is None and w1 is None:
-        # No split available — treat all cache-creation as 5-minute writes.
         w5 = usage.get("cache_creation_input_tokens", 0) or 0
         w1 = 0
     else:
         w5 = w5 or 0
         w1 = w1 or 0
     return (
-        (usage.get("input_tokens", 0) or 0) * r["in"]
-        + (usage.get("output_tokens", 0) or 0) * r["out"]
-        + (usage.get("cache_read_input_tokens", 0) or 0) * r["cache_read"]
+        usage.get("input_tokens", 0) or 0,
+        usage.get("output_tokens", 0) or 0,
+        usage.get("cache_read_input_tokens", 0) or 0,
+        w5,
+        w1,
+    )
+
+
+def cost_of(usage: dict, r: dict) -> float:
+    i, o, cr, w5, w1 = usage_components(usage)
+    return (
+        i * r["in"]
+        + o * r["out"]
+        + cr * r["cache_read"]
         + w5 * r["cache_write_5m"]
         + w1 * r["cache_write_1h"]
     )
 
 
 def scan(projects_dir: Path):
-    """One pass over all transcripts. Returns (daily_cost, daily_tokens, stats).
+    """One pass over all transcripts. Returns (sessions, schema_obs).
 
-    daily_cost / daily_tokens are keyed by local date. Dedupes assistant turns
-    on (message id, requestId) — resumed sessions and sidechains re-emit lines.
+    `sessions` is keyed by session id; each record carries per-day and per-model
+    cost/token rollups (the durable, re-aggregatable grain we archive). Dedupes
+    assistant turns on (message id, requestId) — resumed sessions and sidechains
+    re-emit lines. `schema_obs` tallies the keys seen on `message.usage` (and its
+    cache_creation sub-object) for the schema audit.
     """
-    daily_cost = defaultdict(float)
-    daily_tokens = defaultdict(int)
+    sessions: dict[str, dict] = {}
+    usage_obs = collections.Counter()
+    cc_obs = collections.Counter()
+    obs_turns = 0
     seen = set()
-    unpriced = defaultdict(int)  # model -> turns
-    turns = 0
-    sessions = set()
 
     for path in projects_dir.rglob("*.jsonl"):
+        project = path.parent.name
         try:
-            with path.open("r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    if '"usage"' not in line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    msg = rec.get("message")
-                    if not isinstance(msg, dict):
-                        continue
-                    usage = msg.get("usage")
-                    model = msg.get("model")
-                    if not isinstance(usage, dict) or not model:
-                        continue
-
-                    key = (msg.get("id"), rec.get("requestId"))
-                    if key != (None, None) and key in seen:
-                        continue
-                    seen.add(key)
-
-                    ts = rec.get("timestamp")
-                    if not ts:
-                        continue
-                    try:
-                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    except ValueError:
-                        continue
-                    local_day = dt.astimezone().date()
-
-                    r = rates_for(model)
-                    tok = (
-                        (usage.get("input_tokens", 0) or 0)
-                        + (usage.get("output_tokens", 0) or 0)
-                        + (usage.get("cache_read_input_tokens", 0) or 0)
-                        + (usage.get("cache_creation_input_tokens", 0) or 0)
-                    )
-                    if r is None:
-                        unpriced[model] += 1
-                        continue
-                    turns += 1
-                    sessions.add(rec.get("sessionId"))
-                    daily_cost[local_day] += cost_of(usage, r)
-                    daily_tokens[local_day] += tok
+            fh = path.open("r", encoding="utf-8", errors="replace")
         except OSError:
             continue
+        with fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = rec.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                usage = msg.get("usage")
+                model = msg.get("model")
+                if not isinstance(usage, dict) or not model:
+                    continue
 
-    stats = {"turns": turns, "sessions": len(sessions - {None}), "unpriced": dict(unpriced)}
-    return daily_cost, daily_tokens, stats
+                key = (msg.get("id"), rec.get("requestId"))
+                if key != (None, None) and key in seen:
+                    continue
+                seen.add(key)
+
+                # Schema observation: every deduped usage row, priced or not.
+                obs_turns += 1
+                usage_obs.update(usage.keys())
+                cc = usage.get("cache_creation")
+                if isinstance(cc, dict):
+                    cc_obs.update(cc.keys())
+
+                ts = rec.get("timestamp")
+                if not ts:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                day = dt.astimezone().date().isoformat()
+                sid = rec.get("sessionId") or "(unknown)"
+
+                s = sessions.get(sid)
+                if s is None:
+                    s = sessions[sid] = {
+                        "session_id": sid, "project": project,
+                        "first_seen": ts, "last_seen": ts,
+                        "turns": 0, "cost": 0.0, "tokens": 0,
+                        "by_day": {}, "by_model": {}, "unpriced": {},
+                    }
+                if ts < s["first_seen"]:
+                    s["first_seen"] = ts
+                if ts > s["last_seen"]:
+                    s["last_seen"] = ts
+
+                i, o, cr, w5, w1 = usage_components(usage)
+                tok = i + o + cr + w5 + w1
+                r = rates_for(model)
+                if r is None:
+                    s["unpriced"][model] = s["unpriced"].get(model, 0) + 1
+                    continue
+
+                cost = (i * r["in"] + o * r["out"] + cr * r["cache_read"]
+                        + w5 * r["cache_write_5m"] + w1 * r["cache_write_1h"])
+                s["turns"] += 1
+                s["cost"] += cost
+                s["tokens"] += tok
+                bd = s["by_day"].setdefault(day, {"cost": 0.0, "tokens": 0})
+                bd["cost"] += cost
+                bd["tokens"] += tok
+                bm = s["by_model"].setdefault(model, {
+                    "turns": 0, "cost": 0.0, "tokens": 0, "input": 0, "output": 0,
+                    "cache_read": 0, "cache_write_5m": 0, "cache_write_1h": 0})
+                bm["turns"] += 1
+                bm["cost"] += cost
+                bm["tokens"] += tok
+                bm["input"] += i
+                bm["output"] += o
+                bm["cache_read"] += cr
+                bm["cache_write_5m"] += w5
+                bm["cache_write_1h"] += w1
+
+    schema_obs = {"usage": dict(usage_obs), "usage_cache_creation": dict(cc_obs),
+                  "usage_turns": obs_turns}
+    return sessions, schema_obs
+
+
+# --- Archive (persistence) --------------------------------------------------
+def default_archive_path() -> Path:
+    return Path.home() / ".claude" / "claudit" / "archive.jsonl"
+
+
+def load_archive(path: Path):
+    """Return (header, sessions). Header carries the archive version and the
+    last_collected_date that drives the once-a-day trigger. Missing/garbled
+    file → an empty archive (forward-only: we never recover what's already gone)."""
+    header = {"version": ARCHIVE_VERSION, "last_collected_date": None}
+    sessions: dict[str, dict] = {}
+    if not path.is_file():
+        return header, sessions
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return header, sessions
+    for idx, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if idx == 0 and obj.get("kind") == "claudit-archive":
+            header["version"] = obj.get("version", ARCHIVE_VERSION)
+            header["last_collected_date"] = obj.get("last_collected_date")
+            continue
+        sid = obj.get("session_id")
+        if sid:
+            sessions[sid] = obj
+    return header, sessions
+
+
+def save_archive(path: Path, sessions: dict, today: date) -> None:
+    """Write header + one session per line, atomically (tmp then replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    header = {"kind": "claudit-archive", "version": ARCHIVE_VERSION,
+              "last_collected_date": today.isoformat(),
+              "updated_at": datetime.now().isoformat(timespec="seconds")}
+    out = [json.dumps(header, separators=(",", ":"))]
+    for sid in sorted(sessions):
+        out.append(json.dumps(sessions[sid], separators=(",", ":"), sort_keys=True))
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def merge_sessions(archived: dict, live: dict) -> dict:
+    """Upsert: live (freshly-scanned, possibly grown) wins over archived for any
+    session id present in both."""
+    merged = dict(archived)
+    merged.update(live)
+    return merged
+
+
+def sessions_to_daily(sessions: dict):
+    daily_cost = defaultdict(float)
+    daily_tokens = defaultdict(int)
+    for s in sessions.values():
+        for day, v in s.get("by_day", {}).items():
+            try:
+                d = date.fromisoformat(day)
+            except ValueError:
+                continue
+            daily_cost[d] += v.get("cost", 0.0)
+            daily_tokens[d] += v.get("tokens", 0)
+    return daily_cost, daily_tokens
+
+
+def sessions_stats(sessions: dict) -> dict:
+    turns = 0
+    nsess = 0
+    unpriced = defaultdict(int)
+    for s in sessions.values():
+        turns += s.get("turns", 0)
+        if s.get("turns", 0) > 0:
+            nsess += 1
+        for m, c in s.get("unpriced", {}).items():
+            unpriced[m] += c
+    return {"turns": turns, "sessions": nsess, "unpriced": dict(unpriced)}
+
+
+def should_collect(header: dict, today: date, force: bool) -> bool:
+    """Full path (archive write + schema audit) runs on --collect or the first
+    invocation of a local day; later same-day runs render without side effects."""
+    return force or header.get("last_collected_date") != today.isoformat()
+
+
+# --- Schema audit -----------------------------------------------------------
+def _keys_over(directory: Path, pattern: str):
+    counts = collections.Counter()
+    n = 0
+    if not directory.is_dir():
+        return dict(counts), n
+    for f in directory.glob(pattern):
+        try:
+            obj = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(obj, dict):
+            n += 1
+            counts.update(obj.keys())
+    return dict(counts), n
+
+
+def audit_schema(schema_obs: dict) -> dict:
+    """Diff observed keys (transcripts + usage-data) against SCHEMA_MANIFEST.
+
+    Emits three buckets of facts for the agent to judge: `new` (unrecognized
+    keys — a possible new cost driver), `gone` ("always" fields that have
+    collapsed to near-absence on a well-sampled surface), and `unpriced_drivers`
+    (manifest fields flagged billable-ish that are present but we don't price).
+    """
+    ud = Path.home() / ".claude" / "usage-data"
+    sm = _keys_over(ud / "session-meta", "*.json")
+    fc = _keys_over(ud / "facets", "*.json")
+    obs = {
+        "usage": (schema_obs.get("usage", {}), schema_obs.get("usage_turns", 0)),
+        "usage_cache_creation": (schema_obs.get("usage_cache_creation", {}),
+                                 schema_obs.get("usage_turns", 0)),
+        "session_meta": sm,
+        "facets": fc,
+    }
+
+    new, gone, drivers = [], [], []
+    for surface, spec in SCHEMA_MANIFEST["surfaces"].items():
+        seen, n = obs.get(surface, ({}, 0))
+        known = set(spec)
+        for k, cnt in sorted(seen.items()):
+            if k not in known:
+                new.append({"surface": surface, "key": k, "count": cnt,
+                            "pct": round(cnt / n * 100, 1) if n else 0.0})
+        if n >= SCHEMA_MIN_SAMPLE:
+            for k, meta in spec.items():
+                if meta.get("class") == "always" and seen.get(k, 0) / n < SCHEMA_ALWAYS_MIN:
+                    gone.append({"surface": surface, "key": k,
+                                 "count": seen.get(k, 0), "n": n})
+        for k, meta in spec.items():
+            if meta.get("driver") and seen.get(k, 0) > 0:
+                drivers.append({"surface": surface, "key": k,
+                                "count": seen.get(k, 0), "note": meta.get("note", "")})
+
+    return {
+        "manifest_version": SCHEMA_MANIFEST["version"],
+        "clean": not new and not gone,
+        "new": new,
+        "gone": gone,
+        "unpriced_drivers": drivers,
+        "samples": {s: obs.get(s, ({}, 0))[1] for s in SCHEMA_MANIFEST["surfaces"]},
+    }
 
 
 def read_retention(default: int = 30) -> int:
@@ -174,12 +461,12 @@ def read_retention(default: int = 30) -> int:
 def read_config(path: Path | None) -> dict:
     """Read per-user tunables from a TOML config (signet's per-target file).
 
-    Default path is ~/.claude/report-spending.toml. A missing file → {}. TOML is
-    read with stdlib `tomllib` (Python 3.11+); on an older interpreter a present
+    Default path is ~/.claude/claudit.toml. A missing file → {}. TOML is read
+    with stdlib `tomllib` (Python 3.11+); on an older interpreter a present
     config is skipped with a note rather than crashing — the script stays usable.
     """
     if path is None:
-        path = Path.home() / ".claude" / "report-spending.toml"
+        path = Path.home() / ".claude" / "claudit.toml"
     if not path.is_file():
         return {}
     try:
@@ -213,12 +500,13 @@ def build_report(daily_cost, daily_tokens, stats, today: date, plan: float,
     earliest = min(daily_cost) if daily_cost else today
     available = (today - earliest).days + 1
     # How far back a window can meaningfully reach: the longer of what retention
-    # keeps and what's actually on disk, capped at 90 (the deepest window we show).
+    # keeps and what's actually on record (archive can exceed retention), capped
+    # at 90 (the deepest window we show).
     horizon = min(90, max(retention, available))
 
     def w(start: date, end: date) -> dict:
-        # `truncated`: the window reaches before any transcript we still have on
-        # disk, so the figure is a floor, not the full window.
+        # `truncated`: the window reaches before the earliest day we have on
+        # record, so the figure is a floor, not the full window.
         return {"cost": window_sum(daily_cost, start, end), "truncated": start < earliest}
 
     windows = {}
@@ -332,6 +620,26 @@ def day_table(table: list, pal: "Palette") -> list:
     return lines
 
 
+def schema_lines(sc: dict, pal: "Palette") -> list:
+    """Render the schema-audit section (only present on full-path runs)."""
+    v = sc["manifest_version"]
+    lines = []
+    if sc["clean"]:
+        lines.append(pal("green", f"  Schema check ✓  — manifest v{v}: all known fields present, none new."))
+    else:
+        lines.append(pal("yellow", f"  Schema check ⚠  — manifest v{v}: drift detected (judge each below)."))
+        for d in sc["new"]:
+            lines.append(pal("yellow",
+                f"    + NEW  {d['surface']}.{d['key']}  ({d['count']} recs, {d['pct']}%) — unrecognized; possible new driver"))
+        for d in sc["gone"]:
+            lines.append(pal("yellow",
+                f"    – GONE {d['surface']}.{d['key']}  ({d['count']}/{d['n']}) — was always-present"))
+    for d in sc.get("unpriced_drivers", []):
+        lines.append(pal("dim",
+            f"    • {d['surface']}.{d['key']} present ({d['count']}) but unpriced — {d['note']}"))
+    return lines
+
+
 def render_text(rep: dict, pal: "Palette") -> str:
     plan = rep["plan_monthly"]
     out = []
@@ -358,9 +666,9 @@ def render_text(rep: dict, pal: "Palette") -> str:
         if k not in order:
             out.append(row(k))
     if any_trunc:
-        out.append(f"  * extends before your earliest transcript ({rep['earliest']}); figure is a floor.")
+        out.append(f"  * extends before the earliest day on record ({rep['earliest']}); figure is a floor.")
     out.append(f"  (showing windows up to {rep['horizon_days']}d; transcript retention is "
-               f"{rep['retention_days']}d via cleanupPeriodDays)")
+               f"{rep['retention_days']}d via cleanupPeriodDays — the archive carries history past that)")
     out.append("")
 
     cm, lm = rep["current_month"], rep["last_month"]
@@ -378,7 +686,20 @@ def render_text(rep: dict, pal: "Palette") -> str:
     if s["unpriced"]:
         items = ", ".join(f"{m} ({n})" for m, n in s["unpriced"].items())
         out.append(f"  ⚠ unpriced models skipped: {items}")
+
+    arc = rep.get("archive", {})
+    if arc.get("collected"):
+        out.append(pal("dim", f"  ✓ archive refreshed — {arc['sessions']:,} sessions on record "
+                              f"(history since {rep['earliest']})."))
+    else:
+        out.append(pal("dim", f"  archive: {arc.get('sessions', 0):,} sessions on record "
+                              f"(refreshes once daily; --collect to force)."))
     out.append("")
+
+    if rep.get("schema"):
+        out.extend(schema_lines(rep["schema"], pal))
+        out.append("")
+
     out.append(pal("dim", "  Tip: pipe through a pager to scroll with colour intact — "
                           "`report.py | less -R` (-R keeps the ANSI)."))
     return "\n".join(out)
@@ -397,7 +718,11 @@ def main():
     ap.add_argument("--projects", type=Path, default=None,
                     help="transcripts directory (default ~/.claude/projects)")
     ap.add_argument("--config", type=Path, default=None,
-                    help="TOML config path (default ~/.claude/report-spending.toml)")
+                    help="TOML config path (default ~/.claude/claudit.toml)")
+    ap.add_argument("--archive", type=Path, default=None,
+                    help="per-session archive file (default ~/.claude/claudit/archive.jsonl)")
+    ap.add_argument("--collect", action="store_true",
+                    help="force archive refresh + schema audit (also runs first time each day)")
     args = ap.parse_args()
 
     # Tunables resolve flag > config > built-in default. The config is signet's
@@ -415,18 +740,36 @@ def main():
         print(f"transcripts directory not found: {projects}", file=sys.stderr)
         return 1
 
-    daily_cost, daily_tokens, stats = scan(projects)
+    # Scan live transcripts, then merge with the persisted archive. Live wins on
+    # any session id present in both (a session may have grown since last run).
+    live_sessions, schema_obs = scan(projects)
+    arc_path = args.archive or (Path(cfg["archive"]).expanduser() if cfg.get("archive")
+                                else default_archive_path())
+    header, archived = load_archive(arc_path)
+    merged = merge_sessions(archived, live_sessions)
+
     today = datetime.now().date()
+    collecting = should_collect(header, today, args.collect)
+    schema = None
+    if collecting:
+        save_archive(arc_path, merged, today)
+        schema = audit_schema(schema_obs)
+
+    daily_cost, daily_tokens = sessions_to_daily(merged)
+    stats = sessions_stats(merged)
     retention = int(args.retention or cfg.get("retention") or read_retention())
 
     # Table length: request 30 days by default, but never show days before the
-    # earliest transcript on disk (those would be misleading $0 rows).
+    # earliest day on record (those would be misleading $0 rows).
     earliest = min(daily_cost) if daily_cost else today
     available = (today - earliest).days + 1
     requested = int(args.days or cfg.get("days") or 30)
     table_days = max(1, min(requested, available))
 
     rep = build_report(daily_cost, daily_tokens, stats, today, plan, table_days, retention)
+    rep["archive"] = {"collected": collecting, "sessions": len(merged), "path": str(arc_path)}
+    if schema is not None:
+        rep["schema"] = schema
 
     # Colour resolves flag > config > built-in (on by default); never for JSON.
     mode = args.color or cfg.get("color") or "always"

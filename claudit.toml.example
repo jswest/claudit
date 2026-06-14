@@ -1,6 +1,6 @@
-# report-spending — per-user config (TOML)
+# claudit — per-user config (TOML)
 #
-# Copy this to ~/.claude/report-spending.toml and edit. Everything is optional;
+# Copy this to ~/.claude/claudit.toml and edit. Everything is optional;
 # omit a key to take the built-in default. Command-line flags override anything
 # set here. This file lives OUTSIDE the skill directory on purpose — that's how
 # the skill script (report.py) stays byte-identical across machines while each
