@@ -1,9 +1,9 @@
 ---
-name: report-spending
+name: claudit
 description: Report what your Claude Code usage would have cost on the pay-as-you-go API. Walks every session transcript under ~/.claude/projects, prices each turn at current Anthropic rates with exact cache-tier accounting, and shows API-equivalent cost across time windows (7/30/60/90 days, current + last calendar month) plus a day-by-day table (last 30 days, with a spend bar) and a value comparison against your flat subscription. Use when asked "what would Claude Code cost on the API", "how much am I saving", "my CC spend", or for a usage/cost report.
 ---
 
-# report-spending
+# claudit
 
 You're on a flat Claude subscription, so this is a **hypothetical** "what the same
 work would cost à la carte" figure — a subscription-value report, not a bill.
@@ -11,7 +11,7 @@ work would cost à la carte" figure — a subscription-value report, not a bill.
 ## How to run
 
 ```bash
-python3 ~/.claude/skills/report-spending/report.py
+python3 ~/.claude/skills/claudit/report.py
 ```
 
 Print the script's output to the user as-is (it's already formatted). Flags:
@@ -25,7 +25,11 @@ Print the script's output to the user as-is (it's already formatted). Flags:
   verbatim into a chat carries ANSI escapes — pass `--color never` (or `auto`) if you want it plain.
 - `--json` — machine-readable output instead of the text report.
 - `--projects DIR` — override the transcripts directory.
-- `--config PATH` — TOML config path (default `~/.claude/report-spending.toml`).
+- `--config PATH` — TOML config path (default `~/.claude/claudit.toml`).
+- `--archive PATH` — per-session archive file (default `~/.claude/claudit/archive.jsonl`).
+- `--collect` — force the full path (refresh archive + run the schema audit) even if already
+  done today. The full path also runs **automatically on the first invocation of each local day**;
+  later same-day runs just render (fresh numbers, no archive write, no audit).
 
 ## Config (per-user defaults)
 
@@ -34,7 +38,7 @@ built-in default**, so a different user (different plan) just drops a TOML file
 and never touches the script:
 
 ```bash
-cp ~/.claude/skills/report-spending/report-spending.toml.example ~/.claude/report-spending.toml
+cp ~/.claude/skills/claudit/claudit.toml.example ~/.claude/claudit.toml
 # then edit `plan` to your subscription price
 ```
 
@@ -59,11 +63,48 @@ that would mean a non-stdlib dependency (`PyYAML`), which this skill avoids.
   resolution). Colour is **on by default** (`--color`/`NO_COLOR`/`--color never` to disable);
   with colour off the table still reads cleanly as plain text.
 - **Retention-aware.** Reads `cleanupPeriodDays` from `~/.claude/settings.json`
-  (and `settings.local.json`, default 30). Day-windows deeper than what could be
-  retained are hidden; the horizon is the longer of retention vs. data actually on
-  disk, capped at 90. Windows that reach before the earliest surviving transcript
-  are marked `*` (a floor, not the full window). Raise `cleanupPeriodDays` to let
-  the 60/90-day windows fill in over time.
+  (and `settings.local.json`, default 30). The horizon is the longer of retention
+  vs. history actually on record (the archive can exceed retention), capped at 90.
+  Windows reaching before the earliest day on record are marked `*` (a floor, not
+  the full window).
+- **Persists + audits** on the first run each day — see the two sections below.
+
+## Persistence (the rolling archive)
+
+Claude Code prunes transcripts after `cleanupPeriodDays` (≈30), so cost history
+would evaporate. To beat that, the **full path** upserts a per-session record into
+`~/.claude/claudit/archive.jsonl` (JSONL, one session per line, keyed by
+`session_id`, last-write-wins). Each record keeps per-day and per-model cost/token
+rollups — small enough to keep forever, granular enough to re-aggregate later.
+
+Every run renders from **archive ∪ live transcripts**, so the 60/90-day windows
+fill in over time instead of capping at retention. Forward-only: it can't recover
+sessions already pruned, so it must collect **at least once every ~30 days** or
+that tail is lost (the daily auto-trigger makes this a non-issue with normal use).
+The archive header carries its own version (`ARCHIVE_VERSION`); the format is
+additive-only, so old rows stay readable as fields are added.
+
+## Schema check — do this every run
+
+On the full path the script also **audits the log schema**: it diffs the keys
+actually present in transcripts (`message.usage`) and usage-data
+(`session-meta`, `facets`) against `SCHEMA_MANIFEST` in `report.py`, and prints a
+**Schema check** line. This exists because Anthropic can change session logging —
+adding a new cost driver, renaming a field we price, dropping one we rely on.
+
+- **`Schema check ✓`** — nothing to do; report as-is.
+- **`Schema check ⚠`** — *do not ignore it.* Treat each delta as a task and report
+  back to the user with a recommendation:
+  - **`+ NEW <surface>.<key>`** — an unrecognized field. Judge whether it's a new
+    **billable dimension** (if so it likely belongs in `BASE_RATES`/`cost_of`) or
+    just metadata. A new `usage.*` token field is the high-stakes case.
+  - **`– GONE <surface>.<key>`** — a field we treated as always-present has
+    vanished (a rename or removal upstream). If we *consume* it, a number in the
+    report may now be silently wrong — say so.
+  - **`• <key> … unpriced`** — a known-but-unpriced driver (e.g. `server_tool_use`)
+    is present. Flag if it's grown enough to matter.
+  When a delta is confirmed and incorporated, update `SCHEMA_MANIFEST` (bump its
+  `version`) and the collector/pricing, so the baseline tracks reality.
 
 ## Pricing (per MTok, baked into the script)
 
